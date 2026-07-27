@@ -7,7 +7,7 @@ it into a caller-provided *image.RGBA, with no GPU, cgo, or OS dependency.
 
 It exists for bare-metal targets (GOOS=tamago) where neither the GL/Vulkan
 backends nor the cgo-based gioui.org/cpu fallback can run. Paths are filled
-with a FreeType/AGG-style sparse coverage rasterizer (see internal/scan) and
+with an AGG-style sparse coverage rasterizer (see internal/scan) and
 rasterized path masks are cached across frames keyed by geometry content
 (a hash of the encoded path) and transform, which makes all repeated
 shapes — text glyphs, widget outlines, panels — cheap after their first
@@ -25,6 +25,7 @@ import (
 	"image"
 	"image/color"
 	"math"
+	"runtime"
 
 	"encoding/binary"
 
@@ -36,6 +37,19 @@ import (
 	"gioui.org/swrender/internal/scan"
 	"golang.org/x/image/math/fixed"
 )
+
+// preemptYield gives the Go scheduler a cooperative preemption point roughly
+// every 64 rows inside the long per-row fill loops. On a bare-metal single core
+// these loops otherwise run with no call-safepoint and can monopolize the core
+// for tens of milliseconds (memmove/blend are nosplit), stalling interactive
+// goroutines; yielding here lets the scheduler time-slice the software frame.
+//
+//go:noinline
+func preemptYield(y int) {
+	if y&63 == 0 {
+		runtime.Gosched()
+	}
+}
 
 // Renderer rasterizes Gio op lists into an RGBA image. It retains a path
 // mask cache between frames; reuse one Renderer per output surface.
@@ -415,6 +429,7 @@ func (r *Renderer) fillGeneric(dst *image.RGBA, cl image.Rectangle, masks []*cli
 	op8 := uint32(opacity*255 + .5)
 
 	for y := cl.Min.Y; y < cl.Max.Y; y++ {
+		preemptYield(y)
 		row := dst.Pix[(y-dst.Rect.Min.Y)*dst.Stride:]
 
 		for x := cl.Min.X; x < cl.Max.X; x++ {
@@ -542,6 +557,7 @@ func fillRectSolid(dst *image.RGBA, cl image.Rectangle, c color.NRGBA, opacity f
 		}
 
 		for y := cl.Min.Y + 1; y < cl.Max.Y; y++ {
+			preemptYield(y)
 			i := (y-dst.Rect.Min.Y)*dst.Stride + (cl.Min.X-dst.Rect.Min.X)*4
 			copy(dst.Pix[i:i+w*4], row)
 		}
@@ -550,6 +566,7 @@ func fillRectSolid(dst *image.RGBA, cl image.Rectangle, c color.NRGBA, opacity f
 	}
 
 	for y := cl.Min.Y; y < cl.Max.Y; y++ {
+		preemptYield(y)
 		i := (y-dst.Rect.Min.Y)*dst.Stride + (cl.Min.X-dst.Rect.Min.X)*4
 
 		for x := 0; x < w; x++ {
@@ -572,6 +589,7 @@ func fillMaskSolid(dst *image.RGBA, cl image.Rectangle, m *clipNode, c color.NRG
 	opaque := ca == 255
 
 	for y := cl.Min.Y; y < cl.Max.Y; y++ {
+		preemptYield(y)
 		mrow := m.mask.Pix[(y-m.maskMin.Y)*m.mask.Stride:]
 		drow := dst.Pix[(y-dst.Rect.Min.Y)*dst.Stride:]
 
@@ -1026,6 +1044,23 @@ func (s *maskSpanner) GetSpanFunc() scan.SpanFunc {
 }
 
 func (s *maskSpanner) span(yi, xi0, xi1 int, alpha uint32) {
+	// Clip to the mask bounds. The scanner is sized to the largest glyph seen
+	// (its bounds only grow), so a narrower/shorter mask can otherwise receive
+	// spans past its buffer -- an out-of-bounds heap write.
+	b := s.dst.Rect
+	if yi < b.Min.Y || yi >= b.Max.Y {
+		return
+	}
+	if xi0 < b.Min.X {
+		xi0 = b.Min.X
+	}
+	if xi1 > b.Max.X {
+		xi1 = b.Max.X
+	}
+	if xi0 >= xi1 {
+		return
+	}
+
 	a := uint8(alpha >> 8)
 	row := s.dst.Pix[yi*s.dst.Stride:]
 
