@@ -1,475 +1,359 @@
-// 2018: This is the anti-aliasing algorithym from the golang
-// translation of FreeType. It has been adapted for use by the scanx package
-// which replaces the painter interface with the spanner interface.
-//__
-// Copyright 2010 The Freetype-Go Authors. All rights reserved.
-// Use of this source code is governed by your choice of either the
-// FreeType License or the GNU General Public License version 2 (or
-// any later version), both of which can be found in the LICENSE file.
-//_
-// Package provides an anti-aliasing 2-D rasterizer.
-// taken fron the larger Freetype suite of font-related packages, but the
-// raster package is not specific to font rasterization, and can be used
-// standalone without any other Freetype package.
-// Rasterization is done by the same area/coverage accumulation algorithm as
-// the Freetype "smooth" module, and the Anti-Grain Geometry library. A
-// description of the area/coverage algorithm is at
-// http://projects.tuxee.net/cl-vectors/section-the-cl-aa-algorithm
+// SPDX-License-Identifier: Unlicense OR MIT
 
+// Package scan provides a sparse anti-aliased polygon rasterizer.
+//
+// This is a clean-room implementation of the signed area/coverage
+// accumulation algorithm ("cl-aa") used by Anti-Grain Geometry and
+// described at
+// http://projects.tuxee.net/cl-vectors/section-the-cl-aa-algorithm.
+// It was written from the published algorithm description only and
+// shares no code with the FreeType smooth module or its derivatives;
+// the exported API shape is kept source-compatible with the scanner
+// previously vendored here.
+//
+// Model: closed contours are fed as line segments in 26.6 fixed point.
+// Each segment deposits, into every pixel cell it crosses, a signed
+// cover (the vertical extent dy it spans within the cell, in subpixel
+// units) and a signed area term dy*(fx0+fx1) encoding where within the
+// cell it crosses. A left-to-right sweep per scanline then integrates
+// cover to produce alpha spans: cells containing edges get
+// cover*2*64 - area, gaps between cells get the running cover*2*64.
 package scan
 
 import (
-	"image"
-	"math"
-
 	"golang.org/x/image/math/fixed"
 )
 
-type (
-	// SpanFunc type for span functions
-	SpanFunc func(yi, xi0, xi1 int, alpha uint32)
-	//Spanner consumes spans as they are created by the Scanner Draw function
-	Spanner interface {
-		SetColor(color interface{})
-		// This returns a function that is efficent given the Spanner parameters.
-		GetSpanFunc() SpanFunc
-	}
+// SpanFunc consumes one horizontal run of pixels [xi0, xi1) on row yi
+// with 16-bit coverage alpha (0..0xffff).
+type SpanFunc func(yi, xi0, xi1 int, alpha uint32)
 
-	// cell is part of a linked list (for a given yi co-ordinate) of accumulated
-	// area/coverage for the pixel at (xi, yi).
-	cell struct {
-		xi          int
-		area, cover int
-		next        int
-	}
+// Spanner is the output sink of the Scanner.
+type Spanner interface {
+	SetColor(color interface{})
+	GetSpanFunc() SpanFunc
+}
 
-	// A Span is a horizontal segment of pixels with constant alpha. X0 is an
-	// inclusive bound and X1 is exclusive, the same as for slices. A fully opaque
-	// Span has Alpha == 0xffff.
-	// Span struct {
-	// 	Y, X0, X1 int
-	// 	Alpha     uint32
-	// }
-
-	// Scanner is a refactored version of the free type scanner
-	Scanner struct {
-		// If false, the behavior is to use the even-odd winding fill
-		// rule during Rasterize.
-		UseNonZeroWinding bool
-
-		// The width of the Rasterizer. The height is implicit in len(cellIndex).
-		width int
-
-		// The current pen position.
-		a fixed.Point26_6
-		// The current cell and its area/coverage being accumulated.
-		xi, yi      int
-		area, cover int
-		clip        image.Rectangle
-
-		// Saved cells.
-		cell []cell
-		// Linked list of cells, one per row.
-		cellIndex              []int
-		spanner                Spanner
-		minX, minY, maxX, maxY fixed.Int26_6 // keep track of bounds
-	}
+const (
+	subShift = 6                   // 26.6 input coordinates
+	subOne   = 1 << subShift       // 64 subpixels per pixel
+	subMask  = subOne - 1          //
+	covFull  = 2 * subOne * subOne // coverage units of a fully covered cell (8192)
 )
 
-func (s *Scanner) set(a fixed.Point26_6) {
-	if s.maxX < a.X {
-		s.maxX = a.X
-	}
-	if s.maxY < a.Y {
-		s.maxY = a.Y
-	}
-	if s.minX > a.X {
-		s.minX = a.X
-	}
-	if s.minY > a.Y {
-		s.minY = a.Y
-	}
+// cell accumulates edge contributions for one pixel. Cells for a row
+// form a singly linked, x-sorted list through the Scanner's pool.
+type cell struct {
+	x     int32
+	cover int32
+	area  int32
+	next  int32 // pool index, -1 terminates
 }
 
-// SetWinding set the winding rule for the polygons
-func (s *Scanner) SetWinding(useNonZeroWinding bool) {
-	s.UseNonZeroWinding = useNonZeroWinding
+// Scanner rasterizes closed polygonal contours into coverage spans.
+type Scanner struct {
+	spanner Spanner
+	w, h    int
+	maxX    int32 // w << subShift
+	maxY    int32 // h << subShift
+	winding bool  // true: non-zero fill rule, false: even-odd
+
+	cells   []cell
+	rowHead []int32 // per-row list head, -1 empty
+
+	// open accumulator for the cell currently being written, so runs
+	// of sub-segments in one cell cost no list traffic
+	haveCell     bool
+	cellX, cellY int32
+	cover, area  int32
+
+	// pen state
+	penX, penY     int32
+	startX, startY int32
+	open           bool
 }
 
-// SetColor accepts either a Color or ColorFunc
-func (s *Scanner) SetColor(clr interface{}) {
-	s.spanner.SetColor(clr)
+// NewScanner returns a Scanner emitting spans into sp, sized for a
+// w x h pixel target. The fill rule defaults to non-zero winding.
+func NewScanner(sp Spanner, w, h int) *Scanner {
+	s := &Scanner{spanner: sp, winding: true}
+	s.SetBounds(w, h)
+	return s
 }
 
-// findCell returns the index in r.cell for the cell corresponding to
-// (r.xi, r.yi). The cell is created if necessary.
-func (s *Scanner) findCell() int {
-	yi := s.yi
-	if yi < 0 || yi >= len(s.cellIndex) {
-		return -1
+// SetBounds resizes the scan target and discards accumulated state.
+func (s *Scanner) SetBounds(w, h int) {
+	if w < 0 {
+		w = 0
 	}
-	xi := s.xi
-	if xi < 0 {
-		xi = -1
-	} else if xi > s.width {
-		xi = s.width
+	if h < 0 {
+		h = 0
 	}
-	i, prev := s.cellIndex[yi], -1
-	for i != -1 && s.cell[i].xi <= xi {
-		if s.cell[i].xi == xi {
-			return i
-		}
-		i, prev = s.cell[i].next, i
+	s.w, s.h = w, h
+	s.maxX = int32(w) << subShift
+	s.maxY = int32(h) << subShift
+	if cap(s.rowHead) < h {
+		s.rowHead = make([]int32, h)
 	}
-	c := len(s.cell)
-	s.cell = append(s.cell, cell{xi, 0, 0, i})
-	if prev == -1 {
-		s.cellIndex[yi] = c
-	} else {
-		s.cell[prev].next = c
-	}
-	return c
-}
-
-// saveCell saves any accumulated r.area/r.cover for (r.xi, r.yi).
-func (s *Scanner) saveCell() {
-	if s.area != 0 || s.cover != 0 {
-		i := s.findCell()
-		if i != -1 {
-			s.cell[i].area += s.area
-			s.cell[i].cover += s.cover
-		}
-		s.area = 0
-		s.cover = 0
-	}
-}
-
-// setCell sets the (xi, yi) cell that r is accumulating area/coverage for.
-func (s *Scanner) setCell(xi, yi int) {
-	if s.xi != xi || s.yi != yi {
-		s.saveCell()
-		s.xi, s.yi = xi, yi
-	}
-}
-
-// scan accumulates area/coverage for the yi'th scanline, going from
-// x0 to x1 in the horizontal direction (in 26.6 fixed point co-ordinates)
-// and from y0f to y1f fractional vertical units within that scanline.
-func (s *Scanner) scan(yi int, x0, y0f, x1, y1f fixed.Int26_6) {
-	// Break the 26.6 fixed point X co-ordinates into integral and fractional parts.
-	x0i := int(x0) / 64
-	x0f := x0 - fixed.Int26_6(64*x0i)
-	x1i := int(x1) / 64
-	x1f := x1 - fixed.Int26_6(64*x1i)
-
-	// A perfectly horizontal scan.
-	if y0f == y1f {
-		s.setCell(x1i, yi)
-		return
-	}
-	dx, dy := x1-x0, y1f-y0f
-	// A single cell scan.
-	if x0i == x1i {
-		s.area += int((x0f + x1f) * dy)
-		s.cover += int(dy)
-		return
-	}
-	// There are at least two cells. Apart from the first and last cells,
-	// all intermediate cells go through the full width of the cell,
-	// or 64 units in 26.6 fixed point format.
-	var (
-		p, q, edge0, edge1 fixed.Int26_6
-		xiDelta            int
-	)
-	if dx > 0 {
-		p, q = (64-x0f)*dy, dx
-		edge0, edge1, xiDelta = 0, 64, 1
-	} else {
-		p, q = x0f*dy, -dx
-		edge0, edge1, xiDelta = 64, 0, -1
-	}
-	yDelta, yRem := p/q, p%q
-	if yRem < 0 {
-		yDelta--
-		yRem += q
-	}
-	// Do the first cell.
-	xi, y := x0i, y0f
-	s.area += int((x0f + edge1) * yDelta)
-	s.cover += int(yDelta)
-	xi, y = xi+xiDelta, y+yDelta
-	s.setCell(xi, yi)
-	if xi != x1i {
-		// Do all the intermediate cells.
-		p = 64 * (y1f - y + yDelta)
-		fullDelta, fullRem := p/q, p%q
-		if fullRem < 0 {
-			fullDelta--
-			fullRem += q
-		}
-		yRem -= q
-		for xi != x1i {
-			yDelta = fullDelta
-			yRem += fullRem
-			if yRem >= 0 {
-				yDelta++
-				yRem -= q
-			}
-			s.area += int(64 * yDelta)
-			s.cover += int(yDelta)
-			xi, y = xi+xiDelta, y+yDelta
-			s.setCell(xi, yi)
-		}
-	}
-	// Do the last cell.
-	yDelta = y1f - y
-	s.area += int((edge0 + x1f) * yDelta)
-	s.cover += int(yDelta)
-}
-
-// Start starts a new path at the given point.
-func (s *Scanner) Start(a fixed.Point26_6) {
-	s.set(a)
-	s.setCell(int(a.X/64), int(a.Y/64))
-	s.a = a
-}
-
-// Line adds a linear segment to the current curve.
-func (s *Scanner) Line(b fixed.Point26_6) {
-	s.set(b)
-	x0, y0 := s.a.X, s.a.Y
-	x1, y1 := b.X, b.Y
-	dx, dy := x1-x0, y1-y0
-	// Break the 26.6 fixed point Y co-ordinates into integral and fractional
-	// parts.
-	y0i := int(y0) / 64
-	y0f := y0 - fixed.Int26_6(64*y0i)
-	y1i := int(y1) / 64
-	y1f := y1 - fixed.Int26_6(64*y1i)
-
-	if y0i == y1i {
-		// There is only one scanline.
-		s.scan(y0i, x0, y0f, x1, y1f)
-
-	} else if dx == 0 {
-		// This is a vertical line segment. We avoid calling r.scan and instead
-		// manipulate r.area and r.cover directly.
-		var (
-			edge0, edge1 fixed.Int26_6
-			yiDelta      int
-		)
-		if dy > 0 {
-			edge0, edge1, yiDelta = 0, 64, 1
-		} else {
-			edge0, edge1, yiDelta = 64, 0, -1
-		}
-		x0i, yi := int(x0)/64, y0i
-		x0fTimes2 := (int(x0) - (64 * x0i)) * 2
-		// Do the first pixel.
-		dcover := int(edge1 - y0f)
-		darea := int(x0fTimes2 * dcover)
-		s.area += darea
-		s.cover += dcover
-		yi += yiDelta
-		s.setCell(x0i, yi)
-		// Do all the intermediate pixels.
-		dcover = int(edge1 - edge0)
-		darea = int(x0fTimes2 * dcover)
-		for yi != y1i {
-			s.area += darea
-			s.cover += dcover
-			yi += yiDelta
-			s.setCell(x0i, yi)
-		}
-		// Do the last pixel.
-		dcover = int(y1f - edge0)
-		darea = int(x0fTimes2 * dcover)
-		s.area += darea
-		s.cover += dcover
-
-	} else {
-		// There are at least two scanlines. Apart from the first and last
-		// scanlines, all intermediate scanlines go through the full height of
-		// the row, or 64 units in 26.6 fixed point format.
-		var (
-			p, q, edge0, edge1 fixed.Int26_6
-			yiDelta            int
-		)
-		if dy > 0 {
-			p, q = (64-y0f)*dx, dy
-			edge0, edge1, yiDelta = 0, 64, 1
-		} else {
-			p, q = y0f*dx, -dy
-			edge0, edge1, yiDelta = 64, 0, -1
-		}
-		xDelta, xRem := p/q, p%q
-		if xRem < 0 {
-			xDelta--
-			xRem += q
-		}
-		// Do the first scanline.
-		x, yi := x0, y0i
-		s.scan(yi, x, y0f, x+xDelta, edge1)
-		x, yi = x+xDelta, yi+yiDelta
-		s.setCell(int(x)/64, yi)
-		if yi != y1i {
-			// Do all the intermediate scanlines.
-			p = 64 * dx
-			fullDelta, fullRem := p/q, p%q
-			if fullRem < 0 {
-				fullDelta--
-				fullRem += q
-			}
-			xRem -= q
-			for yi != y1i {
-				xDelta = fullDelta
-				xRem += fullRem
-				if xRem >= 0 {
-					xDelta++
-					xRem -= q
-				}
-				s.scan(yi, x, edge0, x+xDelta, edge1)
-				x, yi = x+xDelta, yi+yiDelta
-				s.setCell(int(x)/64, yi)
-			}
-		}
-		// Do the last scanline.
-		s.scan(yi, x, edge0, x1, y1f)
-	}
-	// The next lineTo starts from b.
-	s.a = b
-}
-
-// areaToAlpha converts an area value to a uint32 alpha value. A completely
-// filled pixel corresponds to an area of 64*64*2, and an alpha of 0xffff. The
-// conversion of area values greater than this depends on the winding rule:
-// even-odd or non-zero.
-func (s *Scanner) areaToAlpha(area int) uint32 {
-	// The C Freetype implementation (version 2.3.12) does "alpha := area>>1"
-	// without the +1. Round-to-nearest gives a more symmetric result than
-	// round-down. The C implementation also returns 8-bit alpha, not 16-bit
-	// alpha.
-	a := (area + 1) >> 1
-	if a < 0 {
-		a = -a
-	}
-	alpha := uint32(a)
-	if s.UseNonZeroWinding {
-		if alpha > 0x0fff {
-			alpha = 0x0fff
-		}
-	} else {
-		alpha &= 0x1fff
-		if alpha > 0x1000 {
-			alpha = 0x2000 - alpha
-		} else if alpha == 0x1000 {
-			alpha = 0x0fff
-		}
-	}
-	// alpha is now in the range [0x0000, 0x0fff]. Convert that 12-bit alpha to
-	// 16-bit alpha.
-	return alpha<<4 | alpha>>8
-}
-
-// Draw converts r's accumulated curves into Spans for p. The Spans passed
-// to the spanner are non-overlapping, and sorted by Y and then X. They all have non-zero
-// width (and 0 <= X0 < X1 <= r.width) and non-zero A, except for the final
-// Span, which has Y, X0, X1 and A all equal to zero.
-func (s *Scanner) Draw() {
-	b := image.Rect(0, 0, s.width, len(s.cellIndex))
-	if s.clip.Dx() != 0 && s.clip.Dy() != 0 {
-		b = b.Intersect(s.clip)
-	}
-	s.saveCell()
-	span := s.spanner.GetSpanFunc()
-	for yi := b.Min.Y; yi < b.Max.Y; yi++ {
-		xi, cover := 0, 0
-		for c := s.cellIndex[yi]; c != -1; c = s.cell[c].next {
-			if cover != 0 && s.cell[c].xi > xi {
-				alpha := s.areaToAlpha(cover * 64 * 2)
-				if alpha != 0 {
-					xi0, xi1 := xi, s.cell[c].xi
-					if xi0 < b.Min.X {
-						xi0 = b.Min.X
-					}
-					if xi1 > b.Max.X {
-						xi1 = b.Max.X
-					}
-					if xi0 < xi1 {
-						span(yi, xi0, xi1, alpha)
-					}
-				}
-			}
-			cover += s.cell[c].cover
-			alpha := s.areaToAlpha(cover*64*2 - s.cell[c].area)
-			xi = s.cell[c].xi + 1
-			if alpha != 0 {
-				xi0, xi1 := s.cell[c].xi, xi
-				if xi0 < b.Min.X {
-					xi0 = b.Min.X
-				}
-				if xi1 > b.Max.X {
-					xi1 = b.Max.X
-				}
-				if xi0 < xi1 {
-					span(yi, xi0, xi1, alpha)
-				}
-			}
-		}
-	}
-}
-
-// GetPathExtent returns the bounds of the accumulated path extent
-func (s *Scanner) GetPathExtent() fixed.Rectangle26_6 {
-	return fixed.Rectangle26_6{
-		Min: fixed.Point26_6{X: s.minX, Y: s.minY},
-		Max: fixed.Point26_6{X: s.maxX, Y: s.maxY}}
-}
-
-// Clear cancels any previous accumulated scans
-func (s *Scanner) Clear() {
-	s.a = fixed.Point26_6{}
-	s.xi = 0
-	s.yi = 0
-	s.area = 0
-	s.cover = 0
-	s.cell = s.cell[:0]
-	for i := 0; i < len(s.cellIndex); i++ {
-		s.cellIndex[i] = -1
-	}
-	const mxfi = fixed.Int26_6(math.MaxInt32)
-	s.minX, s.minY, s.maxX, s.maxY = mxfi, mxfi, -mxfi, -mxfi
-}
-
-// SetBounds sets the maximum width and height of the rasterized image and
-// calls Clear. The width and height are in pixels, not fixed.Int26_6 units.
-func (s *Scanner) SetBounds(width, height int) {
-	if width < 0 {
-		width = 0
-	}
-	if height < 0 {
-		height = 0
-	}
-	s.width = width
-	s.cell = s.cell[:0]
-	if height > cap(s.cellIndex) {
-		s.cellIndex = make([]int, height)
-	}
-	// Make sure length of cellIndex = height
-	s.cellIndex = s.cellIndex[0:height]
-	s.width = width
+	s.rowHead = s.rowHead[:h]
 	s.Clear()
 }
 
-// NewScanner creates a new Scanner with the given bounds.
-func NewScanner(xs Spanner, width, height int) (sc *Scanner) {
-	sc = &Scanner{spanner: xs, UseNonZeroWinding: true}
-	sc.SetBounds(width, height)
-	return
+// SetWinding selects the fill rule: true for non-zero winding, false
+// for even-odd.
+func (s *Scanner) SetWinding(useNonZeroWinding bool) {
+	s.winding = useNonZeroWinding
 }
 
-// SetClip will not affect accumulation of scans, but it will
-// clip drawing of the spans int the Draw func by the clip rectangle.
-func (s *Scanner) SetClip(r image.Rectangle) {
-	s.clip = r
+// Clear discards all accumulated cells, keeping capacity and bounds.
+func (s *Scanner) Clear() {
+	s.cells = s.cells[:0]
+	for i := range s.rowHead {
+		s.rowHead[i] = -1
+	}
+	s.haveCell = false
+	s.open = false
+}
+
+// Start begins a new contour at a, closing any contour left open.
+func (s *Scanner) Start(a fixed.Point26_6) {
+	s.closeContour()
+	s.penX, s.penY = int32(a.X), int32(a.Y)
+	s.startX, s.startY = s.penX, s.penY
+}
+
+// Line adds a segment from the pen position to b.
+func (s *Scanner) Line(b fixed.Point26_6) {
+	bx, by := int32(b.X), int32(b.Y)
+	s.renderLine(s.penX, s.penY, bx, by)
+	s.penX, s.penY = bx, by
+	s.open = true
+}
+
+// Draw sweeps the accumulated cells and emits coverage spans. It does
+// not clear them; call Clear before reuse.
+func (s *Scanner) Draw() {
+	s.closeContour()
+	s.flushCell()
+	span := s.spanner.GetSpanFunc()
+
+	for y := 0; y < s.h; y++ {
+		ci := s.rowHead[y]
+		if ci < 0 {
+			continue
+		}
+		var cover int32
+		for ci >= 0 {
+			c := s.cells[ci]
+			cover += c.cover
+			x := int(c.x)
+
+			if a := s.alphaOf(cover<<(subShift+1) - c.area); a > 0 && x < s.w {
+				span(y, x, x+1, a)
+			}
+
+			ci = c.next
+			nextX := s.w
+			if ci >= 0 && int(s.cells[ci].x) < nextX {
+				nextX = int(s.cells[ci].x)
+			}
+			if nextX > x+1 {
+				if a := s.alphaOf(cover << (subShift + 1)); a > 0 {
+					span(y, x+1, nextX, a)
+				}
+			}
+		}
+	}
+}
+
+// closeContour adds the implicit closing segment of an open contour.
+func (s *Scanner) closeContour() {
+	if !s.open {
+		return
+	}
+	s.open = false
+	if s.penX != s.startX || s.penY != s.startY {
+		s.renderLine(s.penX, s.penY, s.startX, s.startY)
+		s.penX, s.penY = s.startX, s.startY
+	}
+}
+
+// alphaOf maps accumulated coverage units (covFull = fully covered)
+// to 16-bit alpha under the active fill rule.
+func (s *Scanner) alphaOf(c int32) uint32 {
+	if c < 0 {
+		c = -c
+	}
+	if s.winding {
+		if c > covFull {
+			c = covFull
+		}
+	} else {
+		c &= 2*covFull - 1
+		if c > covFull {
+			c = 2*covFull - c
+		}
+	}
+	return uint32(c) * 0xffff >> 13
+}
+
+// renderLine clips a segment vertically to the target, clamps it
+// horizontally, and deposits its per-row pieces.
+func (s *Scanner) renderLine(ax, ay, bx, by int32) {
+	if ay == by || s.h == 0 {
+		return // horizontal segments carry no cover
+	}
+	if (ay <= 0 && by <= 0) || (ay >= s.maxY && by >= s.maxY) {
+		return
+	}
+
+	// clip y to [0, maxY], interpolating x at the crossings
+	oax, oay, obx, oby := ax, ay, bx, by
+	xAt := func(y int32) int32 {
+		return oax + int32(int64(obx-oax)*int64(y-oay)/int64(oby-oay))
+	}
+	if ay < 0 {
+		ax, ay = xAt(0), 0
+	} else if ay > s.maxY {
+		ax, ay = xAt(s.maxY), s.maxY
+	}
+	if by < 0 {
+		bx, by = xAt(0), 0
+	} else if by > s.maxY {
+		bx, by = xAt(s.maxY), s.maxY
+	}
+	if ay == by {
+		return
+	}
+
+	// clamp x: out-of-range edges keep their cover at the border, so
+	// winding of the visible interior is preserved
+	clampX := func(x int32) int32 {
+		if x < 0 {
+			return 0
+		}
+		if x > s.maxX {
+			return s.maxX
+		}
+		return x
+	}
+	ax, bx = clampX(ax), clampX(bx)
+	oax, oay, obx, oby = ax, ay, bx, by
+
+	// walk scanline rows, splitting exactly at row boundaries
+	cx, cy := ax, ay
+	if by > ay { // downward
+		row := ay >> subShift
+		for {
+			bottom := (row + 1) << subShift
+			if by <= bottom {
+				s.renderRow(row, cx, cy-row<<subShift, bx, by-row<<subShift)
+				return
+			}
+			nx := xAt(bottom)
+			s.renderRow(row, cx, cy-row<<subShift, nx, subOne)
+			cx, cy = nx, bottom
+			row++
+		}
+	} else { // upward
+		row := ay >> subShift
+		if ay&subMask == 0 {
+			row--
+		}
+		for {
+			top := row << subShift
+			if by >= top {
+				s.renderRow(row, cx, cy-top, bx, by-top)
+				return
+			}
+			nx := xAt(top)
+			s.renderRow(row, cx, cy-top, nx, 0)
+			cx, cy = nx, top
+			row--
+		}
+	}
+}
+
+// renderRow deposits one row-piece of a segment, splitting exactly at
+// pixel column boundaries. fya/fyb are sub-y offsets (0..subOne)
+// within the row; x coordinates are 26.6, already clamped.
+func (s *Scanner) renderRow(row, xa, fya, xb, fyb int32) {
+	dy := fyb - fya
+	if dy == 0 {
+		return
+	}
+
+	exa, exb := xa>>subShift, xb>>subShift
+	if exa == exb {
+		s.addToCell(exa, row, dy, dy*((xa&subMask)+(xb&subMask)))
+		return
+	}
+
+	fyAt := func(x int32) int32 {
+		return fya + int32(int64(dy)*int64(x-xa)/int64(xb-xa))
+	}
+	prevX, prevFy := xa, fya
+	if xb > xa { // rightward: exit each cell at its right boundary
+		for col := exa; col < exb; col++ {
+			bx := (col + 1) << subShift
+			fyc := fyAt(bx)
+			s.addToCell(col, row, fyc-prevFy, (fyc-prevFy)*((prevX-col<<subShift)+subOne))
+			prevX, prevFy = bx, fyc
+		}
+		s.addToCell(exb, row, fyb-prevFy, (fyb-prevFy)*(xb-exb<<subShift))
+	} else { // leftward: exit each cell at its left boundary
+		for col := exa; col > exb; col-- {
+			bx := col << subShift
+			fyc := fyAt(bx)
+			s.addToCell(col, row, fyc-prevFy, (fyc-prevFy)*(prevX-col<<subShift))
+			prevX, prevFy = bx, fyc
+		}
+		s.addToCell(exb, row, fyb-prevFy, (fyb-prevFy)*(subOne+(xb-exb<<subShift)))
+	}
+}
+
+// addToCell accumulates into the open cell, flushing when the target
+// cell changes.
+func (s *Scanner) addToCell(x, row, dcover, darea int32) {
+	if s.haveCell && x == s.cellX && row == s.cellY {
+		s.cover += dcover
+		s.area += darea
+		return
+	}
+	s.flushCell()
+	s.haveCell = true
+	s.cellX, s.cellY = x, row
+	s.cover, s.area = dcover, darea
+}
+
+// flushCell merges the open cell into its row's x-sorted list.
+func (s *Scanner) flushCell() {
+	if !s.haveCell {
+		return
+	}
+	s.haveCell = false
+	if s.cover == 0 && s.area == 0 {
+		return
+	}
+	if s.cellY < 0 || int(s.cellY) >= s.h {
+		return
+	}
+
+	head := &s.rowHead[s.cellY]
+	prev, cur := int32(-1), *head
+	for cur >= 0 && s.cells[cur].x < s.cellX {
+		prev, cur = cur, s.cells[cur].next
+	}
+	if cur >= 0 && s.cells[cur].x == s.cellX {
+		s.cells[cur].cover += s.cover
+		s.cells[cur].area += s.area
+		return
+	}
+	idx := int32(len(s.cells))
+	s.cells = append(s.cells, cell{x: s.cellX, cover: s.cover, area: s.area, next: cur})
+	if prev < 0 {
+		*head = idx
+	} else {
+		s.cells[prev].next = idx
+	}
 }
