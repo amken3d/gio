@@ -337,6 +337,15 @@ func (r *Renderer) evict() {
 	}
 }
 
+// CacheStats reports the mask cache occupancy: number of entries and the
+// tracked byte total of their alpha masks. The cache is retained between frames
+// and ramps toward maxCacheBytes as a UI shows more distinct shapes, so a host
+// watching heap growth needs to see this to tell a filling cache apart from a
+// leak. Call from the goroutine that calls Frame.
+func (r *Renderer) CacheStats() (entries, bytes int) {
+	return len(r.cache), r.cacheBytes
+}
+
 // paint fills the current clip with the current material.
 func (r *Renderer) paint(dst *image.RGBA, viewport image.Rectangle, state *drawState) {
 	cl := viewport
