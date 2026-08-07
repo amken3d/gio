@@ -10,6 +10,9 @@ import (
 	"testing"
 
 	"gioui.org/internal/f32"
+	"gioui.org/op"
+	"gioui.org/op/clip"
+	"gioui.org/op/paint"
 )
 
 // blitTestImage builds a deterministic premultiplied RGBA test card.
@@ -129,6 +132,43 @@ func TestBlitImageOpaqueRowCopy(t *testing.T) {
 
 	if !bytes.Equal(dst.Pix, img.Pix) {
 		t.Fatalf("opaque identity blit at origin must reproduce the source exactly")
+	}
+}
+
+// TestBlitEngagesThroughFrame renders the exact op sequence a
+// viewport-fitted video frame produces -- rect clip, integer offset,
+// ImageOp, PaintOp -- and asserts the fast path actually took it. This
+// is the regression guard for the engagement condition: a future change
+// that sneaks a scale or a mask into that path shows up here, not as a
+// silent 10x on the target.
+func TestBlitEngagesThroughFrame(t *testing.T) {
+	const W, H = 64, 48
+
+	img := blitTestImage(40, 30, "opaque")
+
+	o := new(op.Ops)
+	cl := clip.Rect{Max: image.Pt(W, H)}.Push(o)
+	off := op.Offset(image.Pt(12, 9)).Push(o)
+	paint.NewImageOp(img).Add(o)
+	paint.PaintOp{}.Add(o)
+	off.Pop()
+	cl.Pop()
+
+	r := New(image.Pt(W, H))
+	dst := image.NewRGBA(image.Rect(0, 0, W, H))
+	r.Frame(o, dst)
+
+	if n := r.BlitCount(); n != 1 {
+		t.Fatalf("identity image paint did not take the fast path (BlitCount=%d)", n)
+	}
+
+	// and the pixels really are the source rows at the offset
+	for y := 0; y < 30; y++ {
+		got := dst.Pix[(y+9)*dst.Stride+12*4 : (y+9)*dst.Stride+(12+40)*4]
+		want := img.Pix[y*img.Stride : y*img.Stride+40*4]
+		if !bytes.Equal(got, want) {
+			t.Fatalf("row %d: blitted pixels differ from source", y)
+		}
 	}
 }
 

@@ -59,6 +59,8 @@ type Renderer struct {
 	scanW   int
 	scanH   int
 
+	blits uint64
+
 	cache      map[maskKey]*maskEntry
 	cacheBytes int
 	frame      uint32
@@ -392,10 +394,20 @@ func (r *Renderer) fill(dst *image.RGBA, cl image.Rectangle, masks []*clipNode, 
 		fillMaskSolid(dst, cl, masks[0], mat.color, opacity)
 	case mat.typ == matImage && mat.img != nil && len(masks) == 0 &&
 		opacity == 1 && identityScale(t):
+		r.blits++
 		blitImage(dst, cl, mat.img, t)
 	default:
 		r.fillGeneric(dst, cl, masks, mat, t, opacity)
 	}
+}
+
+// BlitCount reports how many image paints have taken the identity blit
+// fast path since the renderer was created. It exists to answer, from a
+// live target with no profiler, whether the hot image on screen is
+// actually hitting the fast path (the count advances every frame) or
+// silently falling to the generic sampler (it stays put).
+func (r *Renderer) BlitCount() uint64 {
+	return r.blits
 }
 
 // identityScale reports whether t only translates: unit scale, no
