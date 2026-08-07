@@ -390,9 +390,148 @@ func (r *Renderer) fill(dst *image.RGBA, cl image.Rectangle, masks []*clipNode, 
 		fillRectSolid(dst, cl, mat.color, opacity)
 	case mat.typ == matColor && len(masks) == 1:
 		fillMaskSolid(dst, cl, masks[0], mat.color, opacity)
+	case mat.typ == matImage && mat.img != nil && len(masks) == 0 &&
+		opacity == 1 && identityScale(t):
+		blitImage(dst, cl, mat.img, t)
 	default:
 		r.fillGeneric(dst, cl, masks, mat, t, opacity)
 	}
+}
+
+// identityScale reports whether t only translates: unit scale, no
+// rotation or shear. Such transforms are what an image drawn at its own
+// size produces (a video frame converted at viewport size, a screenshot),
+// and sampling under them degenerates to row copies.
+func identityScale(t f32.Affine2D) bool {
+	sx, hx, _, hy, sy, _ := t.Elems()
+	return sx == 1 && sy == 1 && hx == 0 && hy == 0
+}
+
+// blitImage is the identity-transform image fast path: with unit scale,
+// full opacity and no path masks, the generic path's per-pixel inverse
+// transform, clamp and unpremultiply reduce to three row segments --
+// left edge clamp, straight copy, right edge clamp. For an opaque image
+// (a camera frame) the middle segment is a memmove, which is the whole
+// point: a fullscreen video frame stops costing per-pixel float math.
+//
+// The output is byte-identical to fillGeneric over the same state: the
+// source index derivation mirrors imageAt's truncation, and the
+// translucent fallback reproduces its unpremultiply/re-premultiply
+// rounding exactly.
+func blitImage(dst *image.RGBA, cl image.Rectangle, img *image.RGBA, t f32.Affine2D) {
+	_, _, ox, _, _, oy := t.Elems()
+
+	b := img.Bounds()
+	sw, sh := b.Dx(), b.Dy()
+
+	if sw == 0 || sh == 0 || cl.Empty() {
+		return
+	}
+
+	// imageAt samples source pixel int(float32(x)+.5-ox). For integer x
+	// and non-negative results, truncation is floor, and the map is
+	// x + floor(.5-o) with a constant offset per axis.
+	kx := int(math.Floor(0.5 - float64(ox)))
+	ky := int(math.Floor(0.5 - float64(oy)))
+
+	opaque := imageOpaque(img)
+
+	// Interior x range where the source index needs no clamping.
+	xlo, xhi := cl.Min.X, cl.Max.X
+	if -kx > xlo {
+		xlo = -kx
+	}
+	if sw-kx < xhi {
+		xhi = sw - kx
+	}
+	if xlo > cl.Max.X {
+		xlo = cl.Max.X
+	}
+	if xhi < xlo {
+		xhi = xlo
+	}
+
+	for y := cl.Min.Y; y < cl.Max.Y; y++ {
+		preemptYield(y)
+
+		sy := y + ky
+		if sy < 0 {
+			sy = 0
+		} else if sy >= sh {
+			sy = sh - 1
+		}
+
+		srow := img.Pix[sy*img.Stride:]
+		drow := dst.Pix[(y-dst.Rect.Min.Y)*dst.Stride:]
+
+		// left clamp: source pixel 0; right clamp: source pixel sw-1
+		for x := cl.Min.X; x < xlo; x++ {
+			blitPix(drow[(x-dst.Rect.Min.X)*4:], srow[0:], opaque)
+		}
+
+		if xhi > xlo {
+			si := (xlo + kx) * 4
+			di := (xlo - dst.Rect.Min.X) * 4
+			n := (xhi - xlo) * 4
+
+			if opaque {
+				copy(drow[di:di+n], srow[si:si+n])
+			} else {
+				for x := 0; x < n; x += 4 {
+					blitPix(drow[di+x:], srow[si+x:], false)
+				}
+			}
+		}
+
+		for x := xhi; x < cl.Max.X; x++ {
+			blitPix(drow[(x-dst.Rect.Min.X)*4:], srow[(sw-1)*4:], opaque)
+		}
+	}
+}
+
+// blitPix transfers one premultiplied source pixel, reproducing the
+// generic path's arithmetic: opaque pixels store, translucent ones go
+// through the same unpremultiply (truncating) and re-premultiply
+// (rounding) sequence imageAt+blendPix perform, so the two paths cannot
+// be told apart by output.
+func blitPix(d, s []byte, opaque bool) {
+	pa := s[3]
+
+	if opaque || pa == 255 {
+		d[0], d[1], d[2], d[3] = s[0], s[1], s[2], 255
+		return
+	}
+
+	if pa == 0 {
+		return
+	}
+
+	a := uint32(pa)
+	cr := uint32(s[0]) * 255 / a
+	cg := uint32(s[1]) * 255 / a
+	cb := uint32(s[2]) * 255 / a
+
+	blendPix(d[0:4:4], mul255(cr, a), mul255(cg, a), mul255(cb, a), a)
+}
+
+// imageOpaque reports whether every pixel of img is fully opaque. The
+// scan is a sequential alpha-byte read -- around 2% of the work the
+// per-pixel path would spend on the same image, paid per paint.
+func imageOpaque(img *image.RGBA) bool {
+	b := img.Bounds()
+	w := b.Dx() * 4
+
+	for y := 0; y < b.Dy(); y++ {
+		row := img.Pix[y*img.Stride : y*img.Stride+w]
+
+		for i := 3; i < len(row); i += 4 {
+			if row[i] != 0xff {
+				return false
+			}
+		}
+	}
+
+	return true
 }
 
 // coverage returns the combined mask coverage at device pixel (x, y),
